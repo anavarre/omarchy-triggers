@@ -1,0 +1,21 @@
+# triggers config: copy to ~/.config/triggers/config.toml
+#
+# Each entry has exactly two keys:
+#   trigger = what you type (no spaces)
+#   snippet = what replaces it (any text; use """ for multiple lines)
+#
+# Triggers starting with a letter/digit only fire at the start of a word,
+# so "rg" won't fire inside "forget". Triggers starting with punctuation
+# (e.g. ";sig") fire anywhere.
+#
+# Reload after editing: systemctl --user reload triggers
+
+[[snippets]]
+trigger = "rg"
+snippet = "ripgrep"
+
+[[snippets]]
+trigger = ";sig"
+snippet = """
+Best,
+Aurelien"""
