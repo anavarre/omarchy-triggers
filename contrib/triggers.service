@@ -1,13 +1,46 @@
+# A system unit that runs as you, so that only this process gets the input
+# group, not every program in your session. Install it with the sed command in
+# the README, which fills in the @...@ placeholders.
 [Unit]
 Description=triggers text expander
-PartOf=graphical-session.target
-After=graphical-session.target
 
 [Service]
-ExecStart=%h/.cargo/bin/triggers
+User=@USER@
+SupplementaryGroups=input
+Environment=XDG_RUNTIME_DIR=/run/user/@UID@ WAYLAND_DISPLAY=@WAYLAND_DISPLAY@
+ExecStart=@HOME@/.cargo/bin/triggers
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=2
 
+# It reads every keystroke, so keep it from gaining or reaching anything beyond
+# that. With no network, even a compromised triggers can't send keys anywhere;
+# wtype still reaches the Wayland socket, which is a file.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+# Read-only keyboards: they can be read and grabbed, but not used to inject keys.
+DevicePolicy=closed
+DeviceAllow=char-input r
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+LockPersonality=yes
+RestrictRealtime=yes
+UMask=0077
+
 [Install]
-WantedBy=graphical-session.target
+WantedBy=multi-user.target

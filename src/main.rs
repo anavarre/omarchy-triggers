@@ -25,7 +25,7 @@ const RELEASE_WAIT: Duration = Duration::from_secs(1);
 const USAGE: &str = "usage: triggers [--config PATH] [check]
 
   (no command)  run the expander
-  check         validate the config and list its snippets
+  check         validate the config and list its triggers
 
 Config defaults to $XDG_CONFIG_HOME/triggers/config.toml.
 Send SIGHUP to reload it.";
@@ -55,10 +55,19 @@ fn run() -> Result<()> {
         }
     }
 
+    // This process holds every keystroke and the snippets (maybe passwords).
+    // Non-dumpable, other processes of the same user can't ptrace it or reach
+    // its open keyboards through /proc, and it never writes a core dump.
+    // SAFETY: PR_SET_DUMPABLE takes its argument by value.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } < 0 {
+        bail!("can't make the process non-dumpable: {}", std::io::Error::last_os_error());
+    }
+
     let mut config = Config::load(&config_path)?;
     if check {
+        // Snippets may be passwords, so only their size is shown.
         for s in &config.snippets {
-            println!("{} -> {:?}", s.trigger, s.snippet);
+            println!("{} -> {} char(s)", s.trigger, s.snippet.chars().count());
         }
         println!("{} snippet(s) OK in {}", config.snippets.len(), config_path.display());
         return Ok(());
@@ -238,8 +247,8 @@ fn spawn_keyboard_readers() -> Result<(Receiver<(Key, i32)>, Keyboards)> {
     }
     if fds.is_empty() {
         bail!(
-            "no readable keyboards in /dev/input. Add yourself to the input group \
-             (sudo usermod -aG input $USER) and log in again"
+            "no readable keyboards in /dev/input. Run triggers from the system \
+             service in contrib/, which grants it the input group"
         );
     }
     Ok((rx, Keyboards { fds }))

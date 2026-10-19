@@ -21,6 +21,13 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
+        if let Some(mode) = others_can_read(path) {
+            eprintln!(
+                "triggers: warning: {} is readable by other users (mode {mode:o}); \
+                 snippets can hold secrets, so consider chmod 600",
+                path.display()
+            );
+        }
         Self::parse(&text).with_context(|| format!("in config {}", path.display()))
     }
 
@@ -51,6 +58,13 @@ impl Config {
             .sort_by_key(|s| std::cmp::Reverse(s.trigger.chars().count()));
         Ok(config)
     }
+}
+
+/// The file's permission bits if group or others can read it.
+fn others_can_read(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path).ok()?.permissions().mode() & 0o777;
+    (mode & 0o044 != 0).then_some(mode)
 }
 
 pub fn default_path() -> PathBuf {
