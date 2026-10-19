@@ -23,10 +23,28 @@ const KEYS: &[(Key, char, char)] = &[
     (Key::KEY_SLASH, '/', '?'), (Key::KEY_SPACE, ' ', ' '),
 ];
 
+/// Keys that don't type a character, with their xkb keysym names.
+const NAMED: &[(Key, &str)] = &[
+    (Key::KEY_ENTER, "Return"), (Key::KEY_KPENTER, "KP_Enter"), (Key::KEY_TAB, "Tab"),
+    (Key::KEY_BACKSPACE, "BackSpace"), (Key::KEY_DELETE, "Delete"), (Key::KEY_ESC, "Escape"),
+    (Key::KEY_UP, "Up"), (Key::KEY_DOWN, "Down"), (Key::KEY_LEFT, "Left"),
+    (Key::KEY_RIGHT, "Right"), (Key::KEY_HOME, "Home"), (Key::KEY_END, "End"),
+    (Key::KEY_PAGEUP, "Prior"), (Key::KEY_PAGEDOWN, "Next"),
+];
+
 pub fn to_char(key: Key, shift: bool, caps_lock: bool) -> Option<char> {
     let &(_, lower, upper) = KEYS.iter().find(|(k, _, _)| *k == key)?;
     let shifted = if lower.is_ascii_alphabetic() { shift ^ caps_lock } else { shift };
     Some(if shifted { upper } else { lower })
+}
+
+/// The xkb keysym name for `key`, for replaying it with modifiers. Covers named
+/// keys, letters and digits (whose keysym is the character itself).
+pub fn keysym(key: Key) -> Option<String> {
+    if let Some((_, name)) = NAMED.iter().find(|(k, _)| *k == key) {
+        return Some(name.to_string());
+    }
+    to_char(key, false, false).filter(char::is_ascii_alphanumeric).map(String::from)
 }
 
 #[cfg(test)]
@@ -41,5 +59,12 @@ mod tests {
         assert_eq!(to_char(Key::KEY_SEMICOLON, false, true), Some(';'));
         assert_eq!(to_char(Key::KEY_1, true, false), Some('!'));
         assert_eq!(to_char(Key::KEY_ENTER, false, false), None);
+    }
+
+    #[test]
+    fn keysym_names() {
+        assert_eq!(keysym(Key::KEY_ENTER).as_deref(), Some("Return"));
+        assert_eq!(keysym(Key::KEY_U).as_deref(), Some("u"));
+        assert_eq!(keysym(Key::KEY_SEMICOLON), None);
     }
 }

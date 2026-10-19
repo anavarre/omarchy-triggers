@@ -7,9 +7,11 @@ use anyhow::{bail, Context, Result};
 use config::Config;
 use evdev::{Device, InputEventKind, Key};
 use matcher::Buffer;
+use std::collections::HashSet;
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,23 +67,39 @@ fn run() -> Result<()> {
     let reload = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGHUP, reload.clone())?;
 
-    let rx = spawn_keyboard_readers()?;
+    let (rx, keyboards) = spawn_keyboard_readers()?;
     eprintln!(
         "triggers: {} snippet(s) loaded from {}",
         config.snippets.len(),
         config_path.display()
     );
 
-    let mut buffer = Buffer::default();
-    let mut mods = Modifiers::default();
+    let mut state = State::default();
     let mut last_key = Instant::now();
     let mut pending: Option<Pending> = None;
 
     loop {
-        let (key, value) = match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(event) => event,
-            Err(RecvTimeoutError::Timeout) => (Key::KEY_RESERVED, -1),
-            Err(RecvTimeoutError::Disconnected) => bail!("all keyboards disconnected"),
+        // Typing while the trigger key (or any other) is still held gets keys
+        // dropped or mangled, so the expansion waits for everything to be let go
+        // and for every queued event to be handled.
+        let ready = pending
+            .as_ref()
+            .is_some_and(|p| state.held.is_empty() || p.since.elapsed() > RELEASE_WAIT);
+        let (key, value) = if ready {
+            match rx.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Empty) => {
+                    expand(pending.take().unwrap(), &mut state, &keyboards, &rx);
+                    continue;
+                }
+                Err(TryRecvError::Disconnected) => bail!("all keyboards disconnected"),
+            }
+        } else {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(event) => event,
+                Err(RecvTimeoutError::Timeout) => (Key::KEY_RESERVED, -1),
+                Err(RecvTimeoutError::Disconnected) => bail!("all keyboards disconnected"),
+            }
         };
 
         if reload.swap(false, Ordering::Relaxed) {
@@ -92,38 +110,22 @@ fn run() -> Result<()> {
                 }
                 Err(e) => eprintln!("triggers: keeping old config: {e:#}"),
             }
-            buffer.clear();
+            state.buffer.clear();
         }
 
         // value: 0 = release, 1 = press, 2 = autorepeat
-        let is_mod = value >= 0 && mods.update(key, value);
-
-        // Typing while the trigger key (or a modifier) is still held gets keys
-        // dropped or mangled, so the expansion waits for everything to be let go.
-        if let Some(p) = &mut pending {
-            if key == p.key && value == 0 {
-                p.key_up = true;
-            }
-            if (p.key_up && !mods.held()) || p.since.elapsed() > RELEASE_WAIT {
-                pending.take().unwrap().expand();
-            }
-        }
-
+        let is_mod = state.track(key, value);
         if value <= 0 || is_mod {
             continue;
         }
 
         let now = Instant::now();
         if now.duration_since(last_key) > IDLE_RESET {
-            buffer.clear();
+            state.buffer.clear();
         }
         last_key = now;
 
-        let c = if mods.chord() || key == Key::KEY_BACKSPACE {
-            None
-        } else {
-            keymap::to_char(key, mods.shift(), mods.caps_lock)
-        };
+        let c = state.char_for(key);
 
         // Keys rolled over before the trigger key came up already reached the
         // app: erase them too and retype them after the snippet.
@@ -134,30 +136,28 @@ fn run() -> Result<()> {
                     p.text.push(c);
                     continue;
                 }
-                None => pending.take().unwrap().expand(),
+                None => expand(pending.take().unwrap(), &mut state, &keyboards, &rx),
             }
         }
 
-        if mods.chord() {
-            buffer.clear();
+        if state.mods.chord() {
+            state.buffer.clear();
             continue;
         }
         if key == Key::KEY_BACKSPACE {
-            buffer.pop();
+            state.buffer.pop();
             continue;
         }
         let Some(c) = c else {
             // Enter, Tab, arrows, etc. move the cursor or leave the field.
-            buffer.clear();
+            state.buffer.clear();
             continue;
         };
 
-        buffer.push(c);
-        if let Some(s) = buffer.find(&config.snippets) {
-            buffer.clear();
+        state.buffer.push(c);
+        if let Some(s) = state.buffer.find(&config.snippets) {
+            state.buffer.clear();
             pending = Some(Pending {
-                key,
-                key_up: false,
                 since: now,
                 trigger: s.trigger.clone(),
                 erase: s.trigger.chars().count(),
@@ -167,11 +167,46 @@ fn run() -> Result<()> {
     }
 }
 
+/// Types the snippet. Keys are only read, never grabbed, so one pressed while
+/// wtype is typing (like Enter right after a password trigger, where there's
+/// nothing to watch) would land mid-snippet. So when no key is held, the
+/// keyboards are grabbed while typing and whatever was pressed meanwhile is
+/// replayed after. A held key is never grabbed: the compositor would miss its
+/// release and repeat it.
+fn expand(p: Pending, state: &mut State, keyboards: &Keyboards, rx: &Receiver<(Key, i32)>) {
+    let grabbed = state.held.is_empty() && keyboards.grab();
+    if let Err(e) = output::replace(p.erase, &p.text) {
+        eprintln!("triggers: expanding {:?}: {e:#}", p.trigger);
+    }
+    if !grabbed {
+        return;
+    }
+    // Hold the grab until keys pressed meanwhile are released too, so the
+    // compositor never sees half a keystroke.
+    let since = Instant::now();
+    loop {
+        let mut ops = Vec::new();
+        while let Ok((key, value)) = rx.try_recv() {
+            ops.extend(state.replayed(key, value));
+        }
+        if !ops.is_empty() {
+            if let Err(e) = output::replay(&ops) {
+                eprintln!("triggers: replaying keys: {e:#}");
+            }
+        } else if state.held.is_empty() || since.elapsed() > RELEASE_WAIT {
+            break;
+        } else {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    keyboards.ungrab();
+}
+
 /// Opens every keyboard and forwards its key events to one channel. Devices are
-/// read, never grabbed, so typing always reaches the focused app untouched.
-fn spawn_keyboard_readers() -> Result<mpsc::Receiver<(Key, i32)>> {
+/// read, and only grabbed while a snippet is typed (see `expand`).
+fn spawn_keyboard_readers() -> Result<(Receiver<(Key, i32)>, Keyboards)> {
     let (tx, rx) = mpsc::channel();
-    let mut count = 0;
+    let mut fds = Vec::new();
     for (path, mut device) in evdev::enumerate() {
         if !is_keyboard(&device) {
             continue;
@@ -181,7 +216,11 @@ fn spawn_keyboard_readers() -> Result<mpsc::Receiver<(Key, i32)>> {
             path.display(),
             device.name().unwrap_or("unnamed")
         );
-        count += 1;
+        // A duplicate shares the device's grab state and stays valid even after
+        // the reader thread drops the device.
+        // SAFETY: the device owns this fd and is alive here.
+        let fd = unsafe { BorrowedFd::borrow_raw(device.as_raw_fd()) };
+        fds.push(fd.try_clone_to_owned().context("duplicating keyboard fd")?);
         let tx = tx.clone();
         std::thread::spawn(move || loop {
             let Ok(events) = device.fetch_events() else {
@@ -197,13 +236,13 @@ fn spawn_keyboard_readers() -> Result<mpsc::Receiver<(Key, i32)>> {
             }
         });
     }
-    if count == 0 {
+    if fds.is_empty() {
         bail!(
             "no readable keyboards in /dev/input. Add yourself to the input group \
              (sudo usermod -aG input $USER) and log in again"
         );
     }
-    Ok(rx)
+    Ok((rx, Keyboards { fds }))
 }
 
 fn is_keyboard(device: &Device) -> bool {
@@ -212,21 +251,100 @@ fn is_keyboard(device: &Device) -> bool {
         .is_some_and(|keys| keys.contains(Key::KEY_A) && keys.contains(Key::KEY_ENTER))
 }
 
+/// Handles for grabbing every keyboard, so their keys reach only us.
+struct Keyboards {
+    fds: Vec<OwnedFd>,
+}
+
+impl Keyboards {
+    /// Grabs all keyboards, or none if any can't be (e.g. another program
+    /// holds a grab): a key that slipped through would be typed twice.
+    fn grab(&self) -> bool {
+        for (i, fd) in self.fds.iter().enumerate() {
+            if let Err(e) = set_grab(fd, true) {
+                eprintln!("triggers: can't grab keyboard: {e}");
+                self.fds[..i].iter().for_each(|fd| drop(set_grab(fd, false)));
+                return false;
+            }
+        }
+        true
+    }
+
+    fn ungrab(&self) {
+        for fd in &self.fds {
+            // A keyboard unplugged meanwhile fails here, which is fine.
+            let _ = set_grab(fd, false);
+        }
+    }
+}
+
+fn set_grab(fd: &OwnedFd, on: bool) -> std::io::Result<()> {
+    // _IOW('E', 0x90, int)
+    const EVIOCGRAB: libc::c_ulong = 0x4004_4590;
+    // SAFETY: EVIOCGRAB takes its argument by value; fd is an open evdev device.
+    if unsafe { libc::ioctl(fd.as_raw_fd(), EVIOCGRAB as _, on as libc::c_int) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// A matched trigger waiting for its key to be released.
 struct Pending {
-    key: Key,
-    key_up: bool,
     since: Instant,
     trigger: String,
     erase: usize,
     text: String,
 }
 
-impl Pending {
-    fn expand(self) {
-        if let Err(e) = output::replace(self.erase, &self.text) {
-            eprintln!("triggers: expanding {:?}: {e:#}", self.trigger);
+#[derive(Default)]
+struct State {
+    buffer: Buffer,
+    mods: Modifiers,
+    held: HashSet<Key>,
+}
+
+impl State {
+    /// Tracks held keys and modifiers; returns true if `key` was a modifier.
+    fn track(&mut self, key: Key, value: i32) -> bool {
+        match value {
+            0 => {
+                self.held.remove(&key);
+            }
+            1 => {
+                self.held.insert(key);
+            }
+            _ => {}
         }
+        value >= 0 && self.mods.update(key, value)
+    }
+
+    fn char_for(&self, key: Key) -> Option<char> {
+        if self.mods.chord() || key == Key::KEY_BACKSPACE {
+            None
+        } else {
+            keymap::to_char(key, self.mods.shift(), self.mods.caps_lock)
+        }
+    }
+
+    /// Handles a key pressed during a grab, returning how to replay it.
+    fn replayed(&mut self, key: Key, value: i32) -> Option<output::Op> {
+        if self.track(key, value) || value <= 0 {
+            return None;
+        }
+        if let Some(c) = self.char_for(key) {
+            self.buffer.push(c);
+            return Some(output::Op::Text(c));
+        }
+        if key == Key::KEY_BACKSPACE && !self.mods.chord() {
+            self.buffer.pop();
+        } else {
+            self.buffer.clear();
+        }
+        let Some(sym) = keymap::keysym(key) else {
+            eprintln!("triggers: dropped {key:?} pressed during an expansion");
+            return None;
+        };
+        Some(output::Op::Key { mods: self.mods.names(), sym })
     }
 }
 
@@ -270,11 +388,15 @@ impl Modifiers {
         self.left_shift || self.right_shift
     }
 
-    fn held(&self) -> bool {
-        self.shift() || self.chord()
-    }
-
     fn chord(&self) -> bool {
         self.ctrl != 0 || self.alt != 0 || self.meta != 0
+    }
+
+    /// wtype modifier names for what's held.
+    fn names(&self) -> Vec<&'static str> {
+        [(self.shift(), "shift"), (self.ctrl != 0, "ctrl"), (self.alt != 0, "alt"), (self.meta != 0, "logo")]
+            .into_iter()
+            .filter_map(|(on, name)| on.then_some(name))
+            .collect()
     }
 }

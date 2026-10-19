@@ -3,8 +3,10 @@
 A minimal text expander for Wayland (built for Hyprland). Type a trigger such as
 `rg` in any app and it is replaced with its snippet (`ripgrep`).
 
-It reads keystrokes from `/dev/input` (read-only, never grabbed) and types the
-replacement with `wtype`. There's no GUI and no plugins.
+It reads keystrokes from `/dev/input` and types the replacement with `wtype`.
+While a snippet is being typed, the keyboards are briefly grabbed so keys you
+press meanwhile (say, Enter right after a password trigger) don't land in the
+middle of it. They're typed right after the snippet instead. There's no GUI and no plugins.
 
 ## Config
 

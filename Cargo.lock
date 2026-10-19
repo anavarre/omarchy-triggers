@@ -323,6 +323,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "evdev",
+ "libc",
  "serde",
  "signal-hook",
  "toml",
