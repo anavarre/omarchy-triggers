@@ -2,6 +2,7 @@ mod config;
 mod keymap;
 mod matcher;
 mod output;
+mod template;
 
 use anyhow::{bail, Context, Result};
 use config::Config;
@@ -166,12 +167,19 @@ fn run() -> Result<()> {
         state.buffer.push(c);
         if let Some(s) = state.buffer.find(&config.snippets) {
             state.buffer.clear();
-            pending = Some(Pending {
-                since: now,
-                trigger: s.trigger.clone(),
-                erase: s.trigger.chars().count(),
-                text: s.snippet.clone(),
-            });
+            // Resolved now, so a failure (empty clipboard...) leaves the typed
+            // trigger alone instead of erasing it for nothing.
+            match template::render(&s.snippet) {
+                Ok(text) => {
+                    pending = Some(Pending {
+                        since: now,
+                        trigger: s.trigger.clone(),
+                        erase: s.trigger.chars().count(),
+                        text,
+                    });
+                }
+                Err(e) => eprintln!("triggers: not expanding {:?}: {e:#}", s.trigger),
+            }
         }
     }
 }

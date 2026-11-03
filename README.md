@@ -28,6 +28,10 @@ Joe"""
   readable by you alone (`chmod 600`); `triggers` warns otherwise. Snippet
   text is handed to `wtype` over stdin, never on its command line, so other
   users on the machine can't see it in `ps`.
+- `{{clipboard}}` in a snippet is replaced by the latest clipboard text when
+  the trigger fires (needs `wl-clipboard`). If the clipboard is empty or not
+  text, nothing is expanded and the trigger stays as typed. A literal `{{` is
+  written `{{{{`. Anything else in `{{...}}` is rejected by `triggers check`.
 - Triggers can't contain spaces.
 - A trigger that starts with a letter or digit only fires at the start of a word,
   so `rg` won't fire inside `forget`. It still fires as you start typing `rgb`;
@@ -38,7 +42,7 @@ Joe"""
 ## Install
 
 ```sh
-sudo pacman -S rustup wtype && rustup default stable
+sudo pacman -S rustup wtype wl-clipboard && rustup default stable
 cargo install --path .
 mkdir -p ~/.config/triggers && install -m 600 config.example.toml ~/.config/triggers/config.toml
 sed -e "s|@USER@|$USER|" -e "s|@UID@|$(id -u)|" -e "s|@HOME@|$HOME|" \

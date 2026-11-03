@@ -18,4 +18,15 @@ snippet = "ripgrep"
 trigger = ";sig"
 snippet = """
 Best,
-Aurelien"""
+Joe"""
+
+# {{clipboard}} is replaced by the latest clipboard text when the trigger fires.
+# (A literal "{{" is written "{{{{".)
+[[snippets]]
+trigger = "Thanks for your order!"
+snippet = """
+Hi,
+
+Your order #{{clipboard}} was successfully placed.
+
+Thanks"""

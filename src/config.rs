@@ -48,6 +48,8 @@ impl Config {
                     crate::matcher::MAX_TRIGGER_LEN
                 );
             }
+            crate::template::validate(&s.snippet)
+                .with_context(|| format!("in snippet for trigger {:?}", s.trigger))?;
             if !seen.insert(s.trigger.as_str()) {
                 bail!("duplicate trigger {:?}", s.trigger);
             }
