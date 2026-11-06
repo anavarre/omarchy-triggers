@@ -3,6 +3,8 @@
 # the README, which fills in the @...@ placeholders.
 [Unit]
 Description=triggers text expander
+# Never leave the unit failed after a burst of restarts.
+StartLimitIntervalSec=0
 
 [Service]
 User=@USER@

@@ -9,11 +9,12 @@ use config::Config;
 use evdev::{Device, InputEventKind, Key};
 use matcher::Buffer;
 use std::collections::HashSet;
-use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
-use std::sync::Arc;
+use std::io::ErrorKind;
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Forget what was typed after this long without a keystroke, since the user
@@ -22,6 +23,11 @@ const IDLE_RESET: Duration = Duration::from_secs(5);
 
 /// Expand anyway if the trigger key's release never shows up.
 const RELEASE_WAIT: Duration = Duration::from_secs(1);
+
+/// A new /dev/input node shows up before udev has given the input group access
+/// to it, so opening it is retried for a while (20 x 100ms) on EACCES/ENOENT.
+const OPEN_RETRIES: u32 = 20;
+const OPEN_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 const USAGE: &str = "usage: triggers [--config PATH] [check]
 
@@ -77,7 +83,7 @@ fn run() -> Result<()> {
     let reload = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGHUP, reload.clone())?;
 
-    let (rx, keyboards) = spawn_keyboard_readers()?;
+    let (rx, keyboards) = Keyboards::start();
     eprintln!(
         "triggers: {} snippet(s) loaded from {}",
         config.snippets.len(),
@@ -102,13 +108,13 @@ fn run() -> Result<()> {
                     expand(pending.take().unwrap(), &mut state, &keyboards, &rx);
                     continue;
                 }
-                Err(TryRecvError::Disconnected) => bail!("all keyboards disconnected"),
+                Err(TryRecvError::Disconnected) => bail!("event channel closed"),
             }
         } else {
             match rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(event) => event,
                 Err(RecvTimeoutError::Timeout) => (Key::KEY_RESERVED, -1),
-                Err(RecvTimeoutError::Disconnected) => bail!("all keyboards disconnected"),
+                Err(RecvTimeoutError::Disconnected) => bail!("event channel closed"),
             }
         };
 
@@ -219,68 +225,208 @@ fn expand(p: Pending, state: &mut State, keyboards: &Keyboards, rx: &Receiver<(K
     keyboards.ungrab();
 }
 
-/// Opens every keyboard and forwards its key events to one channel. Devices are
-/// read, and only grabbed while a snippet is typed (see `expand`).
-fn spawn_keyboard_readers() -> Result<(Receiver<(Key, i32)>, Keyboards)> {
-    let (tx, rx) = mpsc::channel();
-    let mut fds = Vec::new();
-    for (path, mut device) in evdev::enumerate() {
-        if !is_keyboard(&device) {
-            continue;
-        }
-        eprintln!(
-            "triggers: listening on {} ({})",
-            path.display(),
-            device.name().unwrap_or("unnamed")
-        );
-        // A duplicate shares the device's grab state and stays valid even after
-        // the reader thread drops the device.
-        // SAFETY: the device owns this fd and is alive here.
-        let fd = unsafe { BorrowedFd::borrow_raw(device.as_raw_fd()) };
-        fds.push(fd.try_clone_to_owned().context("duplicating keyboard fd")?);
-        let tx = tx.clone();
-        std::thread::spawn(move || loop {
-            let Ok(events) = device.fetch_events() else {
-                eprintln!("triggers: lost {}", path.display());
-                return;
-            };
-            for ev in events {
-                if let InputEventKind::Key(key) = ev.kind() {
-                    if tx.send((key, ev.value())).is_err() {
-                        return;
-                    }
-                }
-            }
-        });
-    }
-    if fds.is_empty() {
-        bail!(
-            "no readable keyboards in /dev/input. Run triggers from the system \
-             service in contrib/, which grants it the input group"
-        );
-    }
-    Ok((rx, Keyboards { fds }))
-}
-
 fn is_keyboard(device: &Device) -> bool {
     device
         .supported_keys()
         .is_some_and(|keys| keys.contains(Key::KEY_A) && keys.contains(Key::KEY_ENTER))
 }
 
-/// Handles for grabbing every keyboard, so their keys reach only us.
+/// The keyboards currently open. They are read, and only grabbed while a snippet
+/// is typed (see `expand`). Keyboards come and go: the ones present at startup
+/// are picked up, then /dev/input is watched for new ones (Bluetooth reconnect,
+/// suspend/resume, USB replug). A keyboard that disappears is dropped and the
+/// rest keep working, with no restart.
 struct Keyboards {
-    fds: Vec<OwnedFd>,
+    tx: Sender<(Key, i32)>,
+    devices: Mutex<Vec<Open>>,
 }
 
+struct Open {
+    id: u64,
+    path: PathBuf,
+    /// A duplicate shares the device's grab state and stays valid even after the
+    /// reader thread drops the device.
+    fd: OwnedFd,
+}
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
 impl Keyboards {
+    /// Opens the keyboards present now, then watches for the ones that come later.
+    /// Having none yet is fine: the service waits for one to show up.
+    fn start() -> (Receiver<(Key, i32)>, Arc<Keyboards>) {
+        let (tx, rx) = mpsc::channel();
+        let kb = Arc::new(Keyboards { tx, devices: Mutex::new(Vec::new()) });
+
+        // Watch first, scan second, so a keyboard appearing in between is seen
+        // by one of the two (the other one skips the duplicate).
+        if let Err(e) = kb.watch() {
+            eprintln!("triggers: not watching for new keyboards: {e}");
+        }
+        let mut paths: Vec<PathBuf> = std::fs::read_dir("/dev/input")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| is_event_node(p.file_name().and_then(|n| n.to_str()).unwrap_or("")))
+            .collect();
+        paths.sort();
+        for path in paths {
+            kb.attach(&path, 0);
+        }
+        if kb.devices.lock().unwrap().is_empty() {
+            eprintln!(
+                "triggers: no readable keyboards in /dev/input yet. If one is plugged in, \
+                 run triggers from the system service in contrib/, which grants it the \
+                 input group. Waiting for one to appear"
+            );
+        }
+        (rx, kb)
+    }
+
+    /// Opens `path` if it is a keyboard we don't have yet, and starts reading it.
+    fn attach(self: &Arc<Self>, path: &Path, retries: u32) {
+        let mut tries = 0;
+        let device = loop {
+            match Device::open(path) {
+                Ok(d) => break d,
+                Err(e)
+                    if tries < retries
+                        && matches!(e.kind(), ErrorKind::PermissionDenied | ErrorKind::NotFound) =>
+                {
+                    tries += 1;
+                    std::thread::sleep(OPEN_RETRY_DELAY);
+                }
+                Err(e) => {
+                    if e.kind() != ErrorKind::NotFound {
+                        eprintln!("triggers: can't open {}: {e}", path.display());
+                    }
+                    return;
+                }
+            }
+        };
+        if !is_keyboard(&device) {
+            return;
+        }
+        // SAFETY: the device owns this fd and is alive here.
+        let fd = unsafe { BorrowedFd::borrow_raw(device.as_raw_fd()) };
+        let Ok(fd) = fd.try_clone_to_owned() else {
+            eprintln!("triggers: can't duplicate fd of {}", path.display());
+            return;
+        };
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut devices = self.devices.lock().unwrap();
+            if devices.iter().any(|d| d.path == path) {
+                return;
+            }
+            devices.push(Open { id, path: path.to_owned(), fd });
+        }
+        eprintln!(
+            "triggers: listening on {} ({})",
+            path.display(),
+            device.name().unwrap_or("unnamed")
+        );
+
+        let kb = Arc::clone(self);
+        let path = path.to_owned();
+        std::thread::spawn(move || {
+            // Keys this device holds down, so that losing it mid-press doesn't
+            // leave them looking stuck. Other keyboards are not affected.
+            let mut held = HashSet::new();
+            let mut device = device;
+            'read: loop {
+                let events = match device.fetch_events() {
+                    Ok(events) => events,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                };
+                for ev in events {
+                    if let InputEventKind::Key(key) = ev.kind() {
+                        match ev.value() {
+                            0 => drop(held.remove(&key)),
+                            1 => drop(held.insert(key)),
+                            _ => {}
+                        }
+                        if kb.tx.send((key, ev.value())).is_err() {
+                            break 'read;
+                        }
+                    }
+                }
+            }
+            eprintln!("triggers: lost {}", path.display());
+            kb.devices.lock().unwrap().retain(|d| d.id != id);
+            for key in held {
+                let _ = kb.tx.send((key, 0));
+            }
+        });
+    }
+
+    /// Watches /dev/input for new device nodes with inotify. Removal needs no
+    /// watch: reading a removed device fails, which ends its reader.
+    fn watch(self: &Arc<Self>) -> std::io::Result<()> {
+        // SAFETY: plain syscalls; the fd is wrapped in an OwnedFd right away.
+        let fd = unsafe {
+            let raw = libc::inotify_init1(libc::IN_CLOEXEC);
+            if raw < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            OwnedFd::from_raw_fd(raw)
+        };
+        // SAFETY: the path is a valid NUL-terminated string.
+        let wd = unsafe {
+            libc::inotify_add_watch(
+                fd.as_raw_fd(),
+                c"/dev/input".as_ptr(),
+                libc::IN_CREATE | libc::IN_MOVED_TO,
+            )
+        };
+        if wd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let kb = Arc::clone(self);
+        std::thread::spawn(move || {
+            // u64 elements keep the buffer aligned for inotify_event.
+            let mut buf = [0u64; 512];
+            loop {
+                // SAFETY: the buffer is valid for the length passed.
+                let n = unsafe {
+                    libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), std::mem::size_of_val(&buf))
+                };
+                if n < 0 {
+                    if std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+                        continue;
+                    }
+                    eprintln!("triggers: stopped watching for new keyboards");
+                    return;
+                }
+                // SAFETY: the kernel filled the first n bytes with whole events.
+                let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), n as usize) };
+                for name in inotify_names(bytes) {
+                    if !is_event_node(&name) {
+                        continue;
+                    }
+                    // Own thread: the retries for udev's permissions must not
+                    // hold up other keyboards that appear at the same time.
+                    let kb = Arc::clone(&kb);
+                    std::thread::spawn(move || {
+                        kb.attach(&Path::new("/dev/input").join(name), OPEN_RETRIES)
+                    });
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Grabs all keyboards, or none if any can't be (e.g. another program
     /// holds a grab): a key that slipped through would be typed twice.
     fn grab(&self) -> bool {
-        for (i, fd) in self.fds.iter().enumerate() {
-            if let Err(e) = set_grab(fd, true) {
+        let devices = self.devices.lock().unwrap();
+        for (i, d) in devices.iter().enumerate() {
+            if let Err(e) = set_grab(&d.fd, true) {
                 eprintln!("triggers: can't grab keyboard: {e}");
-                self.fds[..i].iter().for_each(|fd| drop(set_grab(fd, false)));
+                devices[..i].iter().for_each(|d| drop(set_grab(&d.fd, false)));
                 return false;
             }
         }
@@ -288,11 +434,37 @@ impl Keyboards {
     }
 
     fn ungrab(&self) {
-        for fd in &self.fds {
+        for d in self.devices.lock().unwrap().iter() {
             // A keyboard unplugged meanwhile fails here, which is fine.
-            let _ = set_grab(fd, false);
+            let _ = set_grab(&d.fd, false);
         }
     }
+}
+
+fn is_event_node(name: &str) -> bool {
+    name.strip_prefix("event").is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// File names in a buffer of `struct inotify_event`s.
+fn inotify_names(mut bytes: &[u8]) -> Vec<String> {
+    const HEADER: usize = std::mem::size_of::<libc::inotify_event>();
+    let mut names = Vec::new();
+    while bytes.len() >= HEADER {
+        // SAFETY: at least HEADER bytes are available; read_unaligned has no
+        // alignment requirement.
+        let ev: libc::inotify_event = unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) };
+        let end = HEADER + ev.len as usize;
+        if bytes.len() < end {
+            break;
+        }
+        let raw = &bytes[HEADER..end];
+        let raw = raw.split(|&b| b == 0).next().unwrap_or(&[]);
+        if !raw.is_empty() {
+            names.push(String::from_utf8_lossy(raw).into_owned());
+        }
+        bytes = &bytes[end..];
+    }
+    names
 }
 
 fn set_grab(fd: &OwnedFd, on: bool) -> std::io::Result<()> {
@@ -415,5 +587,35 @@ impl Modifiers {
             .into_iter()
             .filter_map(|(on, name)| on.then_some(name))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_nodes() {
+        assert!(is_event_node("event0"));
+        assert!(is_event_node("event23"));
+        assert!(!is_event_node("event"));
+        assert!(!is_event_node("mouse0"));
+        assert!(!is_event_node("by-id"));
+    }
+
+    #[test]
+    fn parses_inotify_buffer() {
+        let header = std::mem::size_of::<libc::inotify_event>();
+        let mut buf = Vec::new();
+        for name in ["event5", "event6"] {
+            let len = 16; // padded, NUL-terminated, as the kernel does
+            let mut ev = vec![0u8; header + len];
+            ev[header - 4..header].copy_from_slice(&(len as u32).to_ne_bytes());
+            ev[header..header + name.len()].copy_from_slice(name.as_bytes());
+            buf.extend(ev);
+        }
+        assert_eq!(inotify_names(&buf), ["event5", "event6"]);
+        // A truncated trailing event is ignored.
+        assert_eq!(inotify_names(&buf[..buf.len() - 5]), ["event5"]);
     }
 }

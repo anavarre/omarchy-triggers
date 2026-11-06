@@ -60,6 +60,15 @@ set (usually `wayland-1`).
 
 Logs: `journalctl -u triggers -f`
 
+### Hotplug
+
+Keyboards are picked up as they appear (USB replug, Bluetooth reconnect,
+suspend/resume) and dropped when they go away, with no restart and no udev rule.
+`/dev/input` is watched with inotify, and a new node is retried briefly because
+udev grants the `input` group access a moment after the node is created. Keys
+held on a keyboard that disappears are released, and other keyboards are
+unaffected. If no keyboard is present at startup, the service waits for one.
+
 ### Why a system service
 
 Reading `/dev/input` takes the `input` group, which also lets a process inject
@@ -81,7 +90,6 @@ user service (`systemctl --user disable --now triggers`, then delete
 ## Limitations
 
 - Keystrokes are decoded as a US layout.
-- Keyboards plugged in after startup aren't picked up; restart the service.
 - The service still runs as your user, so your own processes can read its
   config and could kill or replace it; the sandbox limits what `triggers`
   itself can do, not what can be done to it.
