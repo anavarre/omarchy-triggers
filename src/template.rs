@@ -1,5 +1,6 @@
 //! Placeholders in snippets: `{{name}}` is replaced when the trigger fires, and
-//! `{{{{` types a literal `{{`.
+//! `{{{{` types a literal `{{`. In the snippet's own text (not the clipboard),
+//! `\n` is a newline and `\\` a literal backslash.
 
 use anyhow::{bail, Context, Result};
 use std::io::Read;
@@ -10,23 +11,43 @@ const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(2);
 const CLIPBOARD_MAX_BYTES: u64 = 1 << 20;
 
 #[derive(Debug, PartialEq)]
-enum Part<'a> {
-    Text(&'a str),
+enum Part {
+    Text(String),
     Clipboard,
 }
 
-fn parse(snippet: &str) -> Result<Vec<Part<'_>>> {
+/// Expands `\n` and `\\`; any other backslash is kept as is.
+fn unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match (c, chars.peek()) {
+            ('\\', Some('n')) => {
+                out.push('\n');
+                chars.next();
+            }
+            ('\\', Some('\\')) => {
+                out.push('\\');
+                chars.next();
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn parse(snippet: &str) -> Result<Vec<Part>> {
     let mut parts = Vec::new();
     let mut rest = snippet;
     while let Some(i) = rest.find("{{") {
         if let Some(after) = rest[i..].strip_prefix("{{{{") {
             // Keep one `{{` as text and carry on after the escape.
-            parts.push(Part::Text(&rest[..i + 2]));
+            parts.push(Part::Text(unescape(&rest[..i + 2])));
             rest = after;
             continue;
         }
         if i > 0 {
-            parts.push(Part::Text(&rest[..i]));
+            parts.push(Part::Text(unescape(&rest[..i])));
         }
         let tail = &rest[i + 2..];
         let Some(end) = tail.find("}}") else {
@@ -39,7 +60,7 @@ fn parse(snippet: &str) -> Result<Vec<Part<'_>>> {
         rest = &tail[end + 2..];
     }
     if !rest.is_empty() {
-        parts.push(Part::Text(rest));
+        parts.push(Part::Text(unescape(rest)));
     }
     Ok(parts)
 }
@@ -58,7 +79,7 @@ fn render_with(snippet: &str, clip: impl Fn() -> Result<String>) -> Result<Strin
     let mut out = String::new();
     for part in parse(snippet)? {
         match part {
-            Part::Text(t) => out.push_str(t),
+            Part::Text(t) => out.push_str(&t),
             Part::Clipboard => out.push_str(&clip()?),
         }
     }
@@ -123,6 +144,21 @@ mod tests {
     fn escapes_literal_braces() {
         assert_eq!(r("x {{{{clipboard}} y").unwrap(), "x {{clipboard}} y");
         assert_eq!(r("{{{{{{clipboard}}").unwrap(), "{{CLIP");
+    }
+
+    #[test]
+    fn expands_newline_escapes() {
+        assert_eq!(r(r"a\nb\n\nc").unwrap(), "a\nb\n\nc");
+        assert_eq!(r(r"x ({{clipboard}}).\n\nDocs").unwrap(), "x (CLIP).\n\nDocs");
+        assert_eq!(r(r"a\\nb").unwrap(), "a\\nb");
+        assert_eq!(r(r"C:\dir\x").unwrap(), r"C:\dir\x");
+        assert_eq!(r(r"{{{{\n").unwrap(), "{{\n");
+    }
+
+    #[test]
+    fn clipboard_backslashes_untouched() {
+        let out = render_with("{{clipboard}}", || Ok(r"a\nb".to_string())).unwrap();
+        assert_eq!(out, r"a\nb");
     }
 
     #[test]

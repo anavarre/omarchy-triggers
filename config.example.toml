@@ -21,7 +21,8 @@ Best,
 Joe"""
 
 # {{clipboard}} is replaced by the latest clipboard text when the trigger fires.
-# (A literal "{{" is written "{{{{".)
+# (A literal "{{" is written "{{{{".) In a literal string ('...'), \n and \n\n
+# type a newline and a blank line; \\ types a backslash.
 [[snippets]]
 trigger = "Thanks for your order!"
 snippet = """
